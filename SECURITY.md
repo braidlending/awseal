@@ -52,16 +52,20 @@ CryptoKit reopens the opaque `PrivateKey.dataRepresentation` stored as
 Its supported interface does not expose a trustworthy ACL inspection facility.
 An editable JSON label is not a security attestation.
 
-This version therefore requires **re-login into a fresh directory**. It does
-not migrate or delete old keys. The default directory, key label and HPKE info
-string differ from upstream. Known legacy/unknown key labels are rejected.
-The old directory is rejected before opening its files. These checks prevent
-accidental reuse, not adversarial tampering with same-user files. Do not import
-or relabel keys. The reviewed provisioning code must create the hardened key.
-Fresh logins generate a new key in process. Each decrypted record retains its
-verified key for re-encryption, rather than reloading an editable public key.
-Key metadata additions are locked and reloaded to preserve concurrent logins.
-A biometric enrollment change uses the same fresh-directory recovery process.
+This version therefore requires **re-login into a fresh directory**. Its normal
+path is `~/.awseal`: legacy state there is renamed to a dated backup, then a
+fresh `~/.awseal` is initialized with only non-secret `config.json` profile
+configuration. It does not migrate or delete old keys, encrypted session
+records, or role credentials. The default directory, key label and HPKE info
+string differ from upstream. Known legacy/unknown key labels are rejected
+before writes. These checks prevent accidental reuse, not adversarial tampering
+with same-user files. Do not import or relabel keys. The reviewed provisioning
+code must create the hardened key. Fresh logins generate a new key in process.
+Each decrypted record retains its verified key for re-encryption, rather than
+reloading an editable public key. Key metadata additions are locked and
+reloaded to preserve concurrent logins. A biometric enrollment change uses the
+same fresh-directory recovery process. `--state-dir` remains available for
+isolated test state.
 
 Legacy decrypted JSON remains decodable: the `roleCreds` field is ignored,
 even if malformed. Encoding `Creds` emits only `ssoCreds`. That compatibility
@@ -71,11 +75,12 @@ are atomic ciphertext replacements; no plaintext credential files are created.
 Concurrent issuances can still race on SSO refresh-token rotation, as upstream
 could; avoid simultaneous login/issuance while recovering a profile.
 
-The old vanilla state/binary remain usable until the user deliberately retires
-them after acceptance. Consequently the machine-wide stronger policy is NOT
-established merely by compiling or installing this branch. Old state/backups,
-old executable paths, existing AWS caches and other credential sources must be
-considered in that separate retirement review. Never delete them blindly.
+The dated backup preserves old vanilla state; old executable paths, existing
+AWS caches and other credential sources may still be usable until deliberately
+retired after acceptance. Consequently the machine-wide stronger policy is NOT
+established merely by compiling or installing this branch. Consider the backup,
+old executable paths, existing AWS caches and other credential sources in that
+separate retirement review. Never delete the backup blindly.
 
 ## Unchanged limitations
 

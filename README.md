@@ -25,14 +25,19 @@ These commands do not install the executable. Automated tests use synthetic
 records and do not call AWS or create/use Secure Enclave keys.
 The project has no configured formatter or linter.
 
-## Configure a separate installation after review
+## Replace existing state after review
 
-The hardened executable defaults to `~/.awseal-hardened`. Each subcommand also
-accepts `--state-dir /absolute/path/to/a/new/directory`. It rejects `~/.awseal`
-and paths beneath it. Never copy old keys or encrypted records into the new
-directory. Re-login creates a new key; the old installation stays intact.
+The hardened executable defaults to `~/.awseal`. On its first use with legacy
+state present, it renames that directory to a dated backup, creates a fresh
+`~/.awseal`, and carries forward only non-secret `config.json` profile
+configuration. It never migrates keys, encrypted session records, or role
+credentials. Known legacy key records are refused before any write, so re-login
+creates a new hardened key. Keep the dated backup intact; do not copy its keys
+or encrypted records into the fresh directory.
 
-Create only a new `config.json` with non-secret profile configuration:
+Each subcommand also accepts `--state-dir /absolute/path/to/a/new/directory`
+for an isolated state directory, including tests. Create only a new
+`config.json` with non-secret profile configuration:
 
 ```json
 {
@@ -52,14 +57,15 @@ set and maximum of 64 characters. Controls and bidirectional formatting are
 rejected before constructing the prompt. `ssoRegion` selects both SSO APIs;
 `region` remains available for your AWS service configuration.
 
-Run the separately built binary's `login --profile prod-admin --state-dir ...`
-when ready for the browser and Touch ID acceptance tests. Login stores only
-SSO client/token state encrypted on disk. Each `fetch-role-creds` invocation
-opens a fresh zero-reuse authentication context, decrypts SSO state, obtains
-role credentials and returns AWS JSON. Role credentials are never serialized
-to the protected state. SDK logging is disabled and underlying errors are
-suppressed to avoid exposing response contents. Login alone prints the browser
-authorization URL/code; it does not print SSO bearer or role credentials.
+Run the separately built binary's `login --profile prod-admin` when ready for
+the browser and Touch ID acceptance tests. Use `--state-dir ...` only when an
+isolated test state is intended. Login stores only SSO client/token state
+encrypted on disk. Each `fetch-role-creds` invocation opens a fresh zero-reuse
+authentication context, decrypts SSO state, obtains role credentials and
+returns AWS JSON. Role credentials are never serialized to the protected
+state. SDK logging is disabled and underlying errors are suppressed to avoid
+exposing response contents. Login alone prints the browser authorization
+URL/code; it does not print SSO bearer or role credentials.
 
 The prompt is:
 
@@ -76,9 +82,10 @@ Do not change existing AWS profiles until the hardened artifact is approved.
 ## Installed shell entry point
 
 The shell default uses
-a versioned installed copy of hardened 0.4.0-hardening, not this checkout's
+a versioned installed copy of hardened 0.4.0-hardening.1, not this checkout's
 `.build`. Core local acceptance passed and activation was explicitly approved.
-Existing profiles require fresh login into the separate hardened state directory.
+Existing profiles require fresh login after `~/.awseal` is replaced with the
+new hardened state directory.
 
 ## Release
 

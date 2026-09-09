@@ -173,10 +173,10 @@ struct HardeningTests {
         #expect(second.localizedReason == "second")
     }
 
-    @Test func testLegacyDirectoryIsRejectedWithoutReadingIt() {
-        let legacy = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".awseal").path
-        #expect(throws: (any Error).self) { try StateDirectory(path: legacy) }
-        #expect(throws: (any Error).self) { try StateDirectory(path: legacy + "/nested") }
+    @Test func testDefaultUsesExistingAwsealLocation() throws {
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".awseal").standardizedFileURL.resolvingSymlinksInPath()
+        #expect(try StateDirectory().url == expected)
     }
 
     @Test func testLegacyKeyRequiresReloginWithoutRewritingRecord() throws {
@@ -191,6 +191,9 @@ struct HardeningTests {
         let path = directory.appendingPathComponent("keys.json")
         try bytes.write(to: path)
         #expect(throws: (any Error).self) { try KeyDB(state: state) }
+        #expect(throws: (any Error).self) {
+            try loadCreds(profile: "missing", state: state, reason: "synthetic")
+        }
         #expect(try Data(contentsOf: path) == bytes)
     }
 

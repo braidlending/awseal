@@ -88,7 +88,7 @@ final class KeyDB {
         dec.dataDecodingStrategy = .base64
         self.items = try dec.decode([KeyMetadata].self, from: data)
         guard items.allSatisfy({ $0.label == keyLabel }) else {
-            throw AwsealError.generic("Legacy or unknown key policy. Re-login in a new hardened state directory; keep old state intact.")
+            throw AwsealError.generic("Legacy or unknown key policy. Back up and replace this state directory, then log in again; keys cannot be upgraded in place.")
         }
     }
 
@@ -314,6 +314,8 @@ func ssoLogin(
 }
 
 func loadCreds(profile: String, state: StateDirectory, reason: String) throws -> Creds? {
+    // Refuse legacy keys even when no new-format profile record exists yet.
+    _ = try KeyDB(state: state)
     let fileURL = try state.credentialURL(profile: profile)
     guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
     let decrypted = try loadDecrypted(from: fileURL, state: state, reason: reason)
@@ -483,7 +485,7 @@ func roleCredentialsJSON(creds: RoleCreds) throws -> Data {
 struct Awseal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "An AWS CLI credential_process using AWS SSO to mint credentials while storing secrets under a Secure Enclave key.",
-        version: "0.4.0-hardening",
+        version: "0.4.0-hardening.1",
         subcommands: [Login.self, FetchRoleCreds.self]
     )
 }
@@ -492,7 +494,7 @@ struct Options: ParsableArguments {
     @Option(name: [.long, .customShort("p")], help: "The profile to use.")
     var profile = "default"
 
-    @Option(name: .long, help: "Isolated hardened state directory (default: ~/.awseal-hardened). Never use ~/.awseal.")
+    @Option(name: .long, help: "State directory (default: ~/.awseal). Use a separate directory for isolated tests.")
     var stateDir: String?
 }
 
