@@ -6,3 +6,10 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Local hardened outputs and signing material must never be committed.
+.build-hardened/
+dist/
+*.p12
+*.p8
+*.mobileprovision

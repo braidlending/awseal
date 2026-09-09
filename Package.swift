@@ -10,6 +10,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
+        // Already an AWS SDK dependency; use its no-op handler to keep SDK logs off stdout/stderr.
+        .package(url: "https://github.com/apple/swift-log", from: "1.6.4"),
         .package(url: "https://github.com/awslabs/aws-sdk-swift", from: "1.5.32")
     ],
     targets: [
@@ -19,9 +21,11 @@ let package = Package(
             name: "awseal",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Logging", package: "swift-log"),
                 .product(name: "AWSSSO", package: "aws-sdk-swift"),
                 .product(name: "AWSSSOOIDC", package: "aws-sdk-swift")
             ]
         ),
+        .testTarget(name: "AwsealTests", dependencies: ["awseal"]),
     ]
 )

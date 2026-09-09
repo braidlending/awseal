@@ -1,199 +1,88 @@
-# awseal 🔐
+# awseal — Touch ID credential issuance
 
-A secure AWS credential manager that protects your AWS credentials using
-Apple's Secure Enclave. Inspired by
-[Secretive](https://github.com/maxgoedjen/secretive), `awseal` protects you AWS
-credentials from malicious code by ensuring they can only be accessed with your
-explicit permission.
+A macOS 14+ `credential_process` for AWS IAM Identity Center. This hardening
+branch starts from upstream `49cf00ed9fbd049de5a90cf335c67a0488cbbd0e`
+(`v0.3.1` plus two commits). It retains CryptoKit Secure Enclave P-256 and HPKE.
 
-## 🚨 The Problem
+**Development build: do not replace an existing awseal installation yet.**
+Hardware acceptance and Developer ID release signing remain separate steps.
+See [SECURITY.md](SECURITY.md) for the guarantees and limitations.
 
-Traditional AWS credential storage methods are vulnerable to credential theft:
+## Build and test
 
-- Credentials stored in plain text files can be read by any process
-- Environment variables can be accessed by child processes
-- Malicious code can easily exfiltrate your AWS access keys or cached AWS SSO credentials
+Requires Swift 6 and a macOS developer toolchain with Swift Testing support.
+Never use the default `.build` here if an installed binary points into it.
 
-## 🛡️ The Solution
-
-`awseal` leverages Apple's Secure Enclave to provide hardware-backed security
-for your AWS credentials:
-
-- **Secure Storage**: AWS credentials are encrypted using keys stored in the
-Secure Enclave
-- **User Presence Required**: Access to credentials requires biometric
-authentication (Touch ID, Face ID) or device passcode
-- **Malware Protection**: Even if malicious code runs on your system, it cannot
-access your AWS credentials without your physical presence
-- **Seamless Integration**: Works transparently with the AWS CLI via `credential_process`
-
-## ✨ Features
-
-- **Secure Authentication**: Login once with `awseal login` and your
-credentials are safely stored
-- **Automatic Credential Rotation**: Fresh role credentials are minted
-on-demand when needed
-- **Multiple Profile Support**: Configure different AWS accounts and roles
-- **Hardware Security**: Leverages Apple's Secure Enclave for cryptographic operations
-- **Touch ID Integration**: Biometric authentication for credential access
-
-## 🚀 Installation
-
-```bash
-brew tap hyperscale-consulting/hyperscale
-brew install awseal
+```sh
+swift build --scratch-path /private/tmp/awseal-hardened-debug
+swift test --scratch-path /private/tmp/awseal-hardened-debug
+swift build -c release --scratch-path /private/tmp/awseal-hardened-release
+/private/tmp/awseal-hardened-release/release/awseal --version
 ```
 
-## 📖 Quick Start
+These commands do not install the executable. Automated tests use synthetic
+records and do not call AWS or create/use Secure Enclave keys.
+The project has no configured formatter or linter.
 
-### 1. Configure awseal
+## Configure a separate installation after review
 
-`awseal` is configured via `~/.awseal/config.json`:
+The hardened executable defaults to `~/.awseal-hardened`. Each subcommand also
+accepts `--state-dir /absolute/path/to/a/new/directory`. It rejects `~/.awseal`
+and paths beneath it. Never copy old keys or encrypted records into the new
+directory. Re-login creates a new key; the old installation stays intact.
+
+Create only a new `config.json` with non-secret profile configuration:
 
 ```json
 {
-  "default": {
-    "ssoStartUrl": "https://xxx.awsapps.com/start/#",
-    "ssoRegion": "eu-west-2",
-    "region": "eu-west-2",
+  "prod-admin": {
+    "ssoStartUrl": "https://example.awsapps.com/start",
+    "ssoRegion": "us-east-2",
+    "region": "us-east-2",
     "accountId": "123456789012",
-    "roleName": "MyRole"
-  },
-  "dev": {
-    "ssoStartUrl": "https://xxx.awsapps.com/start/#",
-    "ssoRegion": "eu-west-2",
-    "region": "eu-west-2",
-    "accountId": "123456789012",
-    "roleName": "Developer"
+    "roleName": "AdministratorAccess"
   }
 }
 ```
 
-The top level attributes are the profiles you can reference through
-`--profile`. The default profile is used if this option is omitted. The
-available configuration options for each profile are:
+Profile names allow up to 64 ASCII letters, digits, dots, underscores and
+hyphens. Account IDs have 12 digits; role names use the IAM role-name character
+set and maximum of 64 characters. Controls and bidirectional formatting are
+rejected before constructing the prompt. `ssoRegion` selects both SSO APIs;
+`region` remains available for your AWS service configuration.
 
-- **ssoStartUrl**: Your organization's AWS SSO start URL
-- **ssoRegion**: AWS region where SSO is configured
-- **region**: Default AWS region for API calls
-- **accountId**: Your AWS account ID
-- **roleName**: The role you want to assume
+Run the separately built binary's `login --profile prod-admin --state-dir ...`
+when ready for the browser and Touch ID acceptance tests. Login stores only
+SSO client/token state encrypted on disk. Each `fetch-role-creds` invocation
+opens a fresh zero-reuse authentication context, decrypts SSO state, obtains
+role credentials and returns AWS JSON. Role credentials are never serialized
+to the protected state. SDK logging is disabled and underlying errors are
+suppressed to avoid exposing response contents. Login alone prints the browser
+authorization URL/code; it does not print SSO bearer or role credentials.
 
-### 2. Login to AWS SSO
+The prompt is:
 
-```bash
-awseal login
+```text
+AWS credentials: prod-admin
+Account 123456789012
+Role AdministratorAccess
 ```
 
-This will:
+Do not run `fetch-role-creds` into a terminal. Let the AWS CLI/SDK consume its
+output using a temporary configuration as described in the integration plan.
+Do not change existing AWS profiles until the hardened artifact is approved.
 
-- Open your browser for AWS SSO authentication
-- Store your SSO credentials encrypted under the Secure Enclave
-- Require Touch ID/Face ID to access the stored credentials
+## Installed shell entry point
 
-### 3. Configure AWS CLI
+The shell default uses
+a versioned installed copy of vanilla 0.3.1, not this checkout's `.build`.
+The hardened candidate remains separate until approved.
 
-Configure the AWS CLI to use `awseal` as an external credential provider by
-setting `awseal` as the `credential_process` for each profile you want to use
-it with in `~/.aws/config`:
+## Release
 
-```ini
-[default]
-credential_process = awseal fetch-role-creds
+Release procedures cover Developer ID, Hardened Runtime,
+notarization and a stapled disk image. The manual CI workflow produces only
+unsigned/ad-hoc development artifacts. It does not publish releases.
 
-[profile my-profile]
-credential_process = awseal fetch-role-creds --profile my-profile
-```
-
-### 4. Use AWS CLI Normally
-
-```bash
-# Credentials are automatically fetched and rotated
-aws s3 ls
-aws ec2 describe-instances
-```
-
-## 🔒 Security Architecture
-
-### Secure Enclave Integration
-
-`awseal` uses Apple's Secure Enclave to generate and store cryptographic keys:
-
-1. **Key Generation**: A P-256 key pair is generated in the Secure Enclave
-   during first use
-2. **Access Control**: Keys are protected with `userPresence` requirement
-3. **Credential Encryption**: AWS SSO credentials are encrypted using HPKE
-   (Hybrid Public Key Encryption) with the P256-SHA256-AES-GCM-256 ciphersuite,
-because the Secure Enclave only supports NIST P-256 elliptic curve keys
-4. **Biometric Authentication**: Touch ID/Face ID required to access the
-   encryption key
-
-### Threat Model
-
-`awseal` protects against:
-
-- ✅ **Credential Theft**: Malicious code cannot read encrypted credentials
-- ✅ **Key Extraction**: Private keys never leave the Secure Enclave
-- ✅ **Unauthorized Access**: User presence required to access the Secure
-Enclave key
-
-## 🏗️ How It Works
-
-1. **Login Phase** (`awseal login`):
-   - Authenticate with AWS SSO via browser
-   - Generate Secure Enclave key
-   - Encrypt and store SSO credentials
-
-2. **Credential Fetching** (`awseal fetch-role-creds`):
-   - AWS CLI calls awseal via `credential_process`
-   - awseal decrypts stored credentials (requires Touch ID/Face ID)
-   - Role credentials are fetched from AWS SSO OIDC API and returned to AWS CLI
-   - Role credentials are stored encrypted until they expire
-   - Refresh tokens are used to keep access tokens short-lived for OIDC
-
-3. **Security Guarantees**:
-   - Credentials are never stored in plain text
-   - Access requires physical user presence
-   - Malicious code cannot bypass authentication
-
-## ✅ Verifying a Build
-
-`awseal` has access to your AWS credentials, so you should verify that you're
-installing what you think you are.
-
-The code is easy to audit; it's relatively straightforward and is all in one
-file: [Sources/Awseal.swift](Sources/Awseal/Awseal.swift).
-
-To verify that the binary release was built from the source code you have
-audited, you can use the [slsa-verifier
-tool](https://github.com/slsa-framework/slsa-verifier). `awseal` uses
-[slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator/tree/main)
-for including provenance in releases. After
-[installing](https://github.com/slsa-framework/slsa-verifier#installation)
-`slsa-verifier`, and fetching the binary and provenance file for the [latest
-release](https://github.com/hyperscale-consulting/awseal/releases/latest), you
-can verify the built artifact with:
-
-```bash
-slsa-verifier verify-artifact awseal-v${VERSION}.tar.gz \
-  --provenance-path awseal-v${VERSION}.tar.gz.intoto.jsonl \
-  --source-uri github.com/hyperscale-consulting/awseal \
-  --source-tag v${VERSION}
-```
-
-If you're installing through Homebrew, you can compare the sha256 checksum with
-the checksum in
-[formula](https://github.com/hyperscale-consulting/homebrew-hyperscale/blob/main/Formula/awseal.rb)
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE)
-file for details.
-
-## Security
-
-Our security policy is detailed in [SECURITY.md](SECURITY.md). To report
-security issues, please use [GitHub's private reporting
-feature.](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability#privately-reporting-a-security-vulnerability)
-
----
+MIT licensed; see [LICENSE](LICENSE). No GitHub fork or new repository has been
+created as part of this work.

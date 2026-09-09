@@ -5,6 +5,7 @@ import Foundation
 import CryptoKit
 import LocalAuthentication
 import Security
+import Darwin
 
 enum AwsealError: Error, LocalizedError {
     case generic(String)
@@ -25,21 +26,10 @@ enum AwsealError: Error, LocalizedError {
 struct EnclaveKeyManager {
 
     static func generateKey(label: String) throws -> KeyMetadata {
-        let la = LAContext()
-        la.localizedReason = "Create a Secure Enclave key for awseal (label: \(label))"
+        let la = AuthenticationPolicy.context(reason: "Create awseal Touch ID key")
+        defer { la.invalidate() }
 
-        var error: Unmanaged<CFError>?
-        let flags: SecAccessControlCreateFlags = [.privateKeyUsage, .userPresence]
-
-        guard let ac = SecAccessControlCreateWithFlags(
-            kCFAllocatorDefault,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            flags,
-            &error
-        ) else {
-            let msg = (error?.takeRetainedValue() as Error?)?.localizedDescription ?? "unknown"
-            throw AwsealError.generic("Failed to create SecAccessControl: \(msg)")
-        }
+        let ac = try AuthenticationPolicy.accessControl()
         let priv = try SecureEnclave.P256.KeyAgreement.PrivateKey(
             accessControl: ac,
             authenticationContext: la
@@ -57,12 +47,10 @@ struct EnclaveKeyManager {
         )
     }
 
-    static func openPrivateKey(_ md: KeyMetadata, reason: String) throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
-        let la = LAContext()
-        la.localizedReason = reason
+    static func openPrivateKey(_ md: KeyMetadata, context: LAContext) throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
         return try SecureEnclave.P256.KeyAgreement.PrivateKey(
             dataRepresentation: md.keyPersistentRef,
-            authenticationContext: la
+            authenticationContext: context
         )
     }
 }
@@ -77,13 +65,15 @@ struct KeyMetadata: Codable {
 
 final class KeyDB {
     private let fileURL: URL
+    private let lockURL: URL
     private var items: [KeyMetadata] = []
 
-    init() throws {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let dir = home.appendingPathComponent(".awseal", isDirectory: true)
+    init(state: StateDirectory) throws {
+        let dir = state.url
         self.fileURL = dir.appendingPathComponent("keys.json", isDirectory: false)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.lockURL = dir.appendingPathComponent("keys.lock", isDirectory: false)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
         try load()
     }
 
@@ -97,6 +87,9 @@ final class KeyDB {
         dec.dateDecodingStrategy = .iso8601
         dec.dataDecodingStrategy = .base64
         self.items = try dec.decode([KeyMetadata].self, from: data)
+        guard items.allSatisfy({ $0.label == keyLabel }) else {
+            throw AwsealError.generic("Legacy or unknown key policy. Re-login in a new hardened state directory; keep old state intact.")
+        }
     }
 
     private func save() throws {
@@ -111,15 +104,22 @@ final class KeyDB {
     func list() -> [KeyMetadata] { items }
 
     func add(_ item: KeyMetadata) throws {
-        if items.contains(where: { $0.label == item.label }) {
+        // Concurrent first logins must not overwrite one another's key records.
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw AwsealError.generic("Unable to lock key database.") }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { throw AwsealError.generic("Unable to lock key database.") }
+        defer { flock(descriptor, LOCK_UN) }
+        try load()
+        if items.contains(where: { $0.id == item.id }) {
             throw AwsealError.keyAlreadyExists
         }
         items.append(item)
         try save()
     }
 
-    func resolve(_ label: String) -> KeyMetadata? {
-        return items.first { $0.label == label }
+    func resolve(_ id: UUID) -> KeyMetadata? {
+        return items.first { $0.id == id }
     }
 }
 
@@ -134,29 +134,18 @@ struct Envelope: Codable {
     }
 }
 
-let keyLabel = "consulting.hyperscale.awseal.key"
-let protocolInfo = "awseal key agreement".data(using: .utf8)!
+let keyLabel = "awseal.biometry-current-set.v1"
+let protocolInfo = "awseal hardened SSO state v1".data(using: .utf8)!
 let ciphersuite = HPKE.Ciphersuite.P256_SHA256_AES_GCM_256
 
-func genKey() throws -> KeyMetadata {
-    let db = try KeyDB()
-    if db.resolve(keyLabel) != nil {
-        throw AwsealError.keyAlreadyExists
-    }
+func genKey(state: StateDirectory) throws -> KeyMetadata {
+    let db = try KeyDB(state: state)
     let md = try EnclaveKeyManager.generateKey(label: keyLabel)
     try db.add(md)
     return md
 }
 
-func saveEncrypted(plaintext: Data, to: URL) throws {
-    let db = try KeyDB()
-    let md: KeyMetadata
-    if let existing = db.resolve(keyLabel) {
-        md = existing
-    } else {
-        md = try genKey()
-    }
-
+func saveEncrypted(plaintext: Data, to: URL, key md: KeyMetadata) throws {
     let enclavePub = try P256.KeyAgreement.PublicKey(x963Representation: md.publicKeyX963)
     var hpke = try HPKE.Sender(recipientKey: enclavePub, ciphersuite: ciphersuite, info: protocolInfo)
     let ciphertext = try hpke.seal(plaintext)
@@ -175,23 +164,25 @@ func saveEncrypted(plaintext: Data, to: URL) throws {
     try out.write(to: to, options: [.atomic])
 }
 
-func loadDecrypted(from: URL) throws -> Data {
-    let recoveryInstructions = "Delete ~/.awseal/keys.json if it exsists and run `awseal login` again."
-    let db = try KeyDB()
-    guard let md = db.resolve(keyLabel) else {
-        throw AwsealError.generic("Key not found in database. \(recoveryInstructions)")
-    }
-
+func loadDecrypted(from: URL, state: StateDirectory, reason: String) throws -> (data: Data, key: KeyMetadata) {
+    let recoveryInstructions = "Re-login in a new hardened state directory. Do not delete existing keys or state."
+    let db = try KeyDB(state: state)
     let envelopeData = try Data(contentsOf: from)
     let dec = JSONDecoder()
     dec.dataDecodingStrategy = .base64
     let envelope = try dec.decode(Envelope.self, from: envelopeData)
 
-    guard envelope.keyId == md.id else {
-        throw AwsealError.generic("Envelope key ID (\(envelope.keyId)) doesn't match requested key (\(md.id)). \(recoveryInstructions)")
+    guard let md = db.resolve(envelope.keyId) else {
+        throw AwsealError.generic("Envelope key not found. \(recoveryInstructions)")
     }
 
-    let priv = try EnclaveKeyManager.openPrivateKey(md, reason: "decrypt AWS credentials")
+    let context = AuthenticationPolicy.context(reason: reason)
+    defer { context.invalidate() }
+    let priv = try EnclaveKeyManager.openPrivateKey(md, context: context)
+    // Never re-encrypt SSO tokens to a replaceable, unverified public key.
+    guard priv.publicKey.x963Representation == md.publicKeyX963 else {
+        throw AwsealError.generic("Key metadata mismatch. Refusing to access or rewrite state.")
+    }
 
     var hpke = try HPKE.Recipient(
         privateKey: priv,
@@ -200,8 +191,8 @@ func loadDecrypted(from: URL) throws -> Data {
         encapsulatedKey: envelope.encapsulatedKey
     )
     let plaintext = try hpke.open(envelope.ciphertext)
-    
-    return plaintext
+
+    return (plaintext, md)
 }
 
 struct AWSEALProfile: Codable {
@@ -230,28 +221,24 @@ struct AWSEALConfig: Codable {
     }
 }
 
-func loadConfig() throws -> AWSEALConfig {
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let configURL = home.appendingPathComponent(".awseal/config.json")
-    let config = try AWSEALConfig.load(from: configURL)
-    return config
+func loadConfig(state: StateDirectory) throws -> AWSEALConfig {
+    try AWSEALConfig.load(from: state.url.appendingPathComponent("config.json"))
 }
 
 struct Creds: Codable {
     var ssoCreds: SsoCreds
-    var roleCreds: RoleCreds?
+    // Retain the exact key proven by decryption; never reload a replacement
+    // public key from disk while plaintext tokens are in memory.
+    var encryptionKey: KeyMetadata? = nil
+
+    private enum CodingKeys: String, CodingKey { case ssoCreds }
 }
 
-struct RoleCreds: Codable {
+struct RoleCreds {
     var accessKeyId: String
     var secretAccessKey: String
     var sessionToken: String
     var expiration: Date
-
-    var hasExpired: Bool {
-        let buffer: TimeInterval = 15 * 60
-        return Date() > expiration.addingTimeInterval(-buffer)
-    }
 }
 
 struct SsoCreds: Codable {
@@ -326,34 +313,24 @@ func ssoLogin(
     throw AwsealError.generic("Device authorization timed out.")
 }
 
-func loadCreds(profile: String) throws -> Creds? {
-    let homeDir = FileManager.default.homeDirectoryForCurrentUser
-    let fileURL = homeDir.appendingPathComponent(".awseal/\(profile)")
-
-    guard FileManager.default.fileExists(atPath: fileURL.path) else {
-        return nil
-    }
-
-    let data = try loadDecrypted(from: fileURL)
-    return try JSONDecoder().decode(Creds.self, from: data)
+func loadCreds(profile: String, state: StateDirectory, reason: String) throws -> Creds? {
+    let fileURL = try state.credentialURL(profile: profile)
+    guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+    let decrypted = try loadDecrypted(from: fileURL, state: state, reason: reason)
+    // Synthesized Decodable deliberately ignores the legacy roleCreds field.
+    var creds = try JSONDecoder().decode(Creds.self, from: decrypted.data)
+    creds.encryptionKey = decrypted.key
+    return creds
 }
 
-func saveCreds(profile: String, creds: Creds) throws {
-    let homeDir = FileManager.default.homeDirectoryForCurrentUser
-    let dirURL = homeDir.appendingPathComponent(".awseal")
-
-    if !FileManager.default.fileExists(atPath: dirURL.path) {
-        do {
-            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-        } catch {
-            throw AwsealError.generic("Unable to create directory ~/.awseal")
-        }
-    }
-
-    let fileURL = dirURL.appendingPathComponent(profile)
-
+func saveCreds(profile: String, creds: Creds, state: StateDirectory) throws {
+    let fileURL = try state.credentialURL(profile: profile)
+    try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     let data = try JSONEncoder().encode(creds)
-    try saveEncrypted(plaintext: data, to: fileURL)
+    // New logins provision their own key rather than trusting an imported key.
+    let key = try creds.encryptionKey ?? genKey(state: state)
+    try saveEncrypted(plaintext: data, to: fileURL, key: key)
 }
 
 func registerClient(oidc: SSOOIDCClient, profile: String) async throws -> SsoCreds {
@@ -400,7 +377,7 @@ func refreshAccessToken(profile: String, oidc: SSOOIDCClient, ssoCreds: SsoCreds
             if let refreshToken = tok.refreshToken {
                 updatedCreds.refreshToken = refreshToken
             }
-            return (accessToken, refreshToken)
+            return (accessToken, updatedCreds.refreshToken ?? refreshToken)
         }
         throw AwsealError.notLoggedIn
     } catch is ExpiredTokenException {
@@ -411,33 +388,32 @@ func refreshAccessToken(profile: String, oidc: SSOOIDCClient, ssoCreds: SsoCreds
 func getRoleCreds(sso: SSOClient, accessToken: String, accountId: String, roleName: String) async throws -> RoleCreds {
     let input = GetRoleCredentialsInput(accessToken: accessToken, accountId: accountId, roleName: roleName)
     let response = try await sso.getRoleCredentials(input: input)
-    guard let roleCreds = response.roleCredentials else {
+    guard let roleCreds = response.roleCredentials,
+          let accessKeyId = roleCreds.accessKeyId,
+          let secretAccessKey = roleCreds.secretAccessKey,
+          let sessionToken = roleCreds.sessionToken,
+          !accessKeyId.isEmpty, !secretAccessKey.isEmpty, !sessionToken.isEmpty,
+          roleCreds.expiration > 0 else {
         throw AwsealError.notLoggedIn
     }
 
     let expiration = Date(timeIntervalSince1970: TimeInterval(roleCreds.expiration / 1000))
     return RoleCreds(
-        accessKeyId: roleCreds.accessKeyId!,
-        secretAccessKey: roleCreds.secretAccessKey!,
-        sessionToken: roleCreds.sessionToken!,
+        accessKeyId: accessKeyId,
+        secretAccessKey: secretAccessKey,
+        sessionToken: sessionToken,
         expiration: expiration
     )
 }
 
 func fetchRoleCreds(
-    profile: String, oidc: SSOOIDCClient, sso: SSOClient, region: String, accountId: String, roleName: String
+    profile: String, state: StateDirectory, oidc: SSOOIDCClient, sso: SSOClient, accountId: String, roleName: String
 ) async throws -> RoleCreds {
 
-    guard var creds = try loadCreds(profile: profile) else {
+    guard var creds = try loadCreds(profile: profile, state: state,
+        reason: authenticationReason(profile: profile, account: accountId, role: roleName)) else {
         throw AwsealError.notLoggedIn
     }
-    
-    if let roleCreds = creds.roleCreds {
-        if !roleCreds.hasExpired {
-            return roleCreds
-        }
-    }
-    // role creds not present or expired
 
     guard let accessToken = creds.ssoCreds.accessToken else {
         throw AwsealError.notLoggedIn
@@ -459,25 +435,20 @@ func fetchRoleCreds(
         )
         creds.ssoCreds.accessToken = accessToken
         creds.ssoCreds.refreshToken = refreshToken
-        roleCreds = try await getRoleCreds(
+        // Preserve token rotation even if the subsequent role request fails.
+        try saveCreds(profile: profile, creds: creds, state: state)
+        return try await getRoleCreds(
             sso: sso,
             accessToken: accessToken,
             accountId: accountId,
             roleName: roleName
         )
     }
-    creds.roleCreds = roleCreds
-    try saveCreds(profile: profile, creds: creds)
+    try saveCreds(profile: profile, creds: creds, state: state)
     return roleCreds
 }
 
-func formatExpiration(_ expiration: Int) -> String {
-    let date = Date(timeIntervalSince1970: TimeInterval(expiration / 1000))
-    let formatter = ISO8601DateFormatter()
-    return formatter.string(from: date)
-}
-
-func printRoleCredentials(creds: RoleCreds) {
+func roleCredentialsJSON(creds: RoleCreds) throws -> Data {
     struct RoleCredsOutput: Codable {
         let version: Int
         let accessKeyId: String
@@ -505,17 +476,14 @@ func printRoleCredentials(creds: RoleCreds) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted]
 
-    if let jsonData = try? encoder.encode(output),
-       let jsonString = String(data: jsonData, encoding: .utf8) {
-        print(jsonString)
-    }
+    return try encoder.encode(output)
 }
 
 @main
 struct Awseal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "An AWS CLI credential_process using AWS SSO to mint credentials while storing secrets under a Secure Enclave key.",
-        version: "0.3.1",
+        version: "0.4.0-hardening",
         subcommands: [Login.self, FetchRoleCreds.self]
     )
 }
@@ -523,6 +491,9 @@ struct Awseal: AsyncParsableCommand {
 struct Options: ParsableArguments {
     @Option(name: [.long, .customShort("p")], help: "The profile to use.")
     var profile = "default"
+
+    @Option(name: .long, help: "Isolated hardened state directory (default: ~/.awseal-hardened). Never use ~/.awseal.")
+    var stateDir: String?
 }
 
 extension Awseal {
@@ -534,11 +505,23 @@ extension Awseal {
         @OptionGroup var options: Options
 
         func run() async throws {
-            let config = try loadConfig()
+            do { try await execute() }
+            catch { throw commandError(error) }
+        }
+
+        private func execute() async throws {
+            _ = SDKLogging.disabled
+            let state = try StateDirectory(path: options.stateDir)
+            try validateProfileName(options.profile)
+            let config = try loadConfig(state: state)
             let profileConfig = try config.profile(named: options.profile)
-            let oidc = try SSOOIDCClient(region: profileConfig.ssoRegion)
+            try validateAuthority(account: profileConfig.accountId, role: profileConfig.roleName)
+            _ = try KeyDB(state: state)
+            let oidc = try await SSOOIDCClient(config: .init(
+                ignoreConfiguredEndpointURLs: true, region: profileConfig.ssoRegion, clientLogMode: .some(.none)))
             var creds: Creds
-            if let existing = try loadCreds(profile: options.profile) {
+            if let existing = try loadCreds(profile: options.profile, state: state,
+                reason: authenticationReason(profile: options.profile, account: profileConfig.accountId, role: profileConfig.roleName)) {
                 creds = existing
             } else {
                 let ssoCreds = try await registerClient(oidc: oidc, profile: options.profile)
@@ -564,7 +547,7 @@ extension Awseal {
                 )
             }
             creds.ssoCreds = ssoCreds
-            try saveCreds(profile: options.profile, creds: creds)
+            try saveCreds(profile: options.profile, creds: creds, state: state)
         }
     }
 
@@ -576,19 +559,32 @@ extension Awseal {
         @OptionGroup var options: Options
 
         func run() async throws {
-            let config = try loadConfig()
+            do { try await execute() }
+            catch { throw commandError(error) }
+        }
+
+        private func execute() async throws {
+            _ = SDKLogging.disabled
+            let state = try StateDirectory(path: options.stateDir)
+            try validateProfileName(options.profile)
+            let config = try loadConfig(state: state)
             let profileConfig = try config.profile(named: options.profile)
-            let oidc = try SSOOIDCClient(region: profileConfig.ssoRegion)
-            let sso = try SSOClient(region: profileConfig.region)
+            try validateAuthority(account: profileConfig.accountId, role: profileConfig.roleName)
+            let oidc = try await SSOOIDCClient(config: .init(
+                ignoreConfiguredEndpointURLs: true, region: profileConfig.ssoRegion, clientLogMode: .some(.none)))
+            let sso = try await SSOClient(config: .init(
+                ignoreConfiguredEndpointURLs: true, region: profileConfig.ssoRegion, clientLogMode: .some(.none)))
             let creds = try await fetchRoleCreds(
                 profile: options.profile,
+                state: state,
                 oidc: oidc,
                 sso: sso,
-                region: profileConfig.region,
                 accountId: profileConfig.accountId,
                 roleName: profileConfig.roleName
             )
-            printRoleCredentials(creds: creds)
+            let output = try roleCredentialsJSON(creds: creds)
+            FileHandle.standardOutput.write(output)
+            FileHandle.standardOutput.write(Data("\n".utf8))
         }
     }
 
