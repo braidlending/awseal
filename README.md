@@ -5,7 +5,8 @@ branch starts from upstream `49cf00ed9fbd049de5a90cf335c67a0488cbbd0e`
 (`v0.3.1` plus two commits). It retains CryptoKit Secure Enclave P-256 and HPKE.
 
 **Development build: do not replace an existing awseal installation yet.**
-Hardware acceptance and Developer ID release signing remain separate steps.
+Hardware acceptance remains required. This Mac can use an ad-hoc-signed local
+release with Hardened Runtime, without notarization.
 See [SECURITY.md](SECURITY.md) for the guarantees and limitations.
 
 ## Build and test
@@ -80,8 +81,8 @@ The hardened candidate remains separate until approved.
 
 ## Release
 
-Release procedures cover Developer ID, Hardened Runtime,
-notarization and a stapled disk image. The manual CI workflow produces only
+Release procedures cover local ad-hoc signing with Hardened
+Runtime, plus an optional Developer ID/notarization distribution workflow. The manual CI workflow produces only
 unsigned/ad-hoc development artifacts. It does not publish releases.
 
 MIT licensed; see [LICENSE](LICENSE). No GitHub fork or new repository has been

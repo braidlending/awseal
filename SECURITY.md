@@ -96,8 +96,11 @@ considered in that separate retirement review. Never delete them blindly.
   running as the same user. Hardware ACLs do not attest the displayed role.
 
 Caller-process reporting was omitted: it supplies no authorization boundary.
-Production requires reviewed source, a trusted binary location, Developer ID
-signing and Hardened Runtime without debugging/runtime exceptions. Signing is
+Local production use requires reviewed source, a trusted binary location and
+Hardened Runtime without debugging/runtime exceptions. Ad-hoc signing is the
+selected local path; it does not authenticate a developer identity. Developer
+ID/notarization belong to the optional distribution workflow, not the biometric
+access-control policy. Signing is
 not a solution to arbitrary replacement of a user-writable executable.
 
 ## Reporting
