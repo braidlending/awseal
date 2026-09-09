@@ -4,7 +4,7 @@ A macOS 14+ `credential_process` for AWS IAM Identity Center. This hardening
 branch starts from upstream `49cf00ed9fbd049de5a90cf335c67a0488cbbd0e`
 (`v0.3.1` plus two commits). It retains CryptoKit Secure Enclave P-256 and HPKE.
 
-**Development build: do not replace an existing awseal installation yet.**
+**Local hardened release: review the acceptance record and limitations before use.**
 Hardware acceptance remains required. This Mac can use an ad-hoc-signed local
 release with Hardened Runtime, without notarization.
 See [SECURITY.md](SECURITY.md) for the guarantees and limitations.
@@ -76,8 +76,9 @@ Do not change existing AWS profiles until the hardened artifact is approved.
 ## Installed shell entry point
 
 The shell default uses
-a versioned installed copy of vanilla 0.3.1, not this checkout's `.build`.
-The hardened candidate remains separate until approved.
+a versioned installed copy of hardened 0.4.0-hardening, not this checkout's
+`.build`. Core local acceptance passed and activation was explicitly approved.
+Existing profiles require fresh login into the separate hardened state directory.
 
 ## Release
 
@@ -85,5 +86,4 @@ Release procedures cover local ad-hoc signing with Hardened
 Runtime, plus an optional Developer ID/notarization distribution workflow. The manual CI workflow produces only
 unsigned/ad-hoc development artifacts. It does not publish releases.
 
-MIT licensed; see [LICENSE](LICENSE). No GitHub fork or new repository has been
-created as part of this work.
+MIT licensed; see [LICENSE](LICENSE). The maintained fork is [braidlending/awseal](https://github.com/braidlending/awseal).
