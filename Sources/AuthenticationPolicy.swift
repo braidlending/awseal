@@ -57,5 +57,24 @@ func validateAuthority(account: String, role: String) throws {
 // they may contain response bodies or credential-bearing values.
 func commandError(_ error: Error) -> AwsealError {
     if let known = error as? AwsealError { return known }
+    if localAuthenticationCode(error) == .biometryLockout {
+        return .generic("Touch ID is locked. Lock your Mac, unlock it with your login password, then retry.")
+    }
     return .generic("Operation failed. Check configuration, Touch ID authorization, connectivity and SSO login; underlying details suppressed to protect credentials.")
+}
+
+private func localAuthenticationCode(_ error: Error) -> LAError.Code? {
+    var current = error as NSError
+
+    // Security and CryptoKit may wrap the LocalAuthentication failure. Inspect
+    // only the stable domain/code pair and never include an error description.
+    for _ in 0..<4 {
+        if current.domain == LAError.errorDomain {
+            return LAError.Code(rawValue: current.code)
+        }
+        guard let underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError,
+              underlying !== current else { return nil }
+        current = underlying
+    }
+    return nil
 }

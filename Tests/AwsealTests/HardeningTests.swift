@@ -160,6 +160,37 @@ struct HardeningTests {
         }
     }
 
+    @Test func testBiometryLockoutHasActionableSanitizedError() {
+        let secret = "LOCAL_AUTH_SECRET_SENTINEL"
+        let lockout = NSError(
+            domain: LAError.errorDomain,
+            code: LAError.Code.biometryLockout.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: secret]
+        )
+        let wrapped = NSError(
+            domain: NSCocoaErrorDomain,
+            code: 1,
+            userInfo: [NSUnderlyingErrorKey: lockout, NSLocalizedDescriptionKey: secret]
+        )
+
+        for error in [lockout, wrapped] {
+            let message = commandError(error).localizedDescription
+            #expect(message == "Touch ID is locked. Lock your Mac, unlock it with your login password, then retry.")
+            #expect(!message.contains(secret))
+        }
+    }
+
+    @Test func testOtherLocalAuthenticationErrorsRemainGeneric() {
+        let error = NSError(
+            domain: LAError.errorDomain,
+            code: LAError.Code.authenticationFailed.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: "LOCAL_AUTH_SECRET_SENTINEL"]
+        )
+        let message = commandError(error).localizedDescription
+        #expect(message.contains("underlying details suppressed"))
+        #expect(!message.contains("LOCAL_AUTH_SECRET_SENTINEL"))
+    }
+
     @Test func testStrictPolicyAndFreshContexts() throws {
         #expect(AuthenticationPolicy.flags == [.privateKeyUsage, .biometryCurrentSet])
         _ = try AuthenticationPolicy.accessControl()

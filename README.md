@@ -206,6 +206,9 @@ precedence over your selected profile. Never print those variables or use
 
 - **Session expired:** run `awseal login --profile <name>` and complete browser
   authorization again.
+- **Touch ID is locked:** lock the Mac, unlock it with the login password, then
+  retry. awseal reports this condition directly and does not offer a password
+  fallback for decrypting an existing key.
 - **Unexpected Touch ID prompt:** cancel it. A process can request a prompt;
   the displayed profile does not authenticate the calling process.
 - **Profile not found:** check the name in `~/.awseal/config.json` and the
