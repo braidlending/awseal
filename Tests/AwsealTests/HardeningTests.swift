@@ -2,6 +2,8 @@ import Foundation
 import LocalAuthentication
 import Security
 import Testing
+import AWSSSO
+import AWSSSOOIDC
 @testable import awseal
 
 struct HardeningTests {
@@ -232,5 +234,47 @@ struct HardeningTests {
         let state = try StateDirectory(path: "/private/tmp/awseal-layout-test")
         #expect(try state.credentialURL(profile: "keys.json").deletingLastPathComponent().lastPathComponent == "credentials")
         #expect(throws: (any Error).self) { try state.credentialURL(profile: "../config.json") }
+    }
+
+    @Test func testOnlyLapsedSessionErrorsTriggerBrowserLogin() {
+        let lapsed: [Error] = [ExpiredTokenException(), InvalidGrantException(), InvalidClientException(), UnauthorizedClientException()]
+        for error in lapsed { #expect(isExpiredSession(error)) }
+        let other: [Error] = [AccessDeniedException(), InternalServerException(), SlowDownException(),
+            AWSSSO.UnauthorizedException(), URLError(.notConnectedToInternet), AwsealError.generic("x")]
+        for error in other { #expect(!isExpiredSession(error)) }
+    }
+
+    @Test func testBrowserLoginRefusesNonHttpsURLs() {
+        #expect(!openInBrowser(URL(string: "file:///Applications/Calculator.app")!))
+        #expect(!openInBrowser(URL(string: "http://example.com")!))
+    }
+
+    @Test func testProfileLockSerializesAndStaysOutOfCredentialFiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let state = try StateDirectory(path: directory.path)
+        let sharedState = SharedState(state)
+        final class Counter: @unchecked Sendable { var active = 0; var maxActive = 0; let lock = NSLock() }
+        let counter = Counter()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<4 {
+                group.addTask {
+                    try await withProfileLock(profile: "dev", state: sharedState.value) {
+                        counter.lock.withLock { counter.active += 1; counter.maxActive = max(counter.maxActive, counter.active) }
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                        counter.lock.withLock { counter.active -= 1 }
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+        #expect(counter.maxActive == 1)
+        // A profile named "dev.lock" must never share a path with dev's lock.
+        let credentials = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        #expect(credentials == ["locks"])
+        await #expect(throws: (any Error).self) {
+            try await withProfileLock(profile: "../keys.json", state: state) {}
+        }
     }
 }

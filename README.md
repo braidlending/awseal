@@ -204,8 +204,12 @@ precedence over your selected profile. Never print those variables or use
 
 ## Everyday use and troubleshooting
 
-- **Session expired:** run `awseal login --profile <name>` and complete browser
-  authorization again.
+- **Session expired:** after your Touch ID approval, `fetch-role-creds` opens
+  the browser authorization itself and continues once you approve it, so the
+  AWS command succeeds without a separate login. Concurrent requests for the
+  same profile wait for that one login. If no browser can be opened, or the
+  `credential_process` line passes `--no-auto-login`, it fails instead; run
+  `awseal login --profile <name>` and complete browser authorization again.
 - **Touch ID is locked:** lock the Mac, unlock it with the login password, then
   retry. awseal reports this condition directly and does not offer a password
   fallback for decrypting an existing key.

@@ -248,11 +248,26 @@ struct SsoCreds: Codable {
     var refreshToken: String?
 }
 
+// Returns whether the browser was launched; never writes to stdout, which is
+// reserved for credential_process output.
+func openInBrowser(_ url: URL) -> Bool {
+    guard url.scheme == "https" else { return false }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    process.arguments = [url.absoluteString]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return false }
+    process.waitUntilExit()
+    return process.terminationStatus == 0
+}
+
 func ssoLogin(
     oidc: SSOOIDCClient,
     profile: String,
     ssoCreds: SsoCreds,
-    ssoStartUrl: String
+    ssoStartUrl: String,
+    requireBrowser: Bool
 ) async throws -> SsoCreds {
     let startDeviceAuthorizationInput = StartDeviceAuthorizationInput(
         clientId: ssoCreds.clientId, clientSecret: ssoCreds.clientSecret, startUrl: ssoStartUrl
@@ -271,15 +286,18 @@ func ssoLogin(
     let verificationUriComplete = resp.verificationUriComplete
     let interval = resp.interval
 
-    print("""
-    To complete SSO login, open the following URL in your browser and confirm / enter the code (\(userCode)) if required:
+    FileHandle.standardError.write(Data("""
+    To complete SSO login for \(profile), open the following URL in your browser and confirm / enter the code (\(userCode)) if required:
 
       \(verificationUriComplete ?? verificationUri ?? "<no verification URL>")
-    """)
 
-    if let urlString = verificationUriComplete ?? verificationUri,
-       let url = URL(string: urlString) {
-        _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/open"), arguments: [url.absoluteString])
+    """.utf8))
+
+    let opened = (verificationUriComplete ?? verificationUri).flatMap(URL.init(string:)).map(openInBrowser) ?? false
+    // Without a browser nobody can approve the request; fail now rather than
+    // blocking a credential_process caller until the device code expires.
+    if requireBrowser && !opened {
+        throw AwsealError.notLoggedIn
     }
 
     let start = Date()
@@ -382,9 +400,60 @@ func refreshAccessToken(profile: String, oidc: SSOOIDCClient, ssoCreds: SsoCreds
             return (accessToken, updatedCreds.refreshToken ?? refreshToken)
         }
         throw AwsealError.notLoggedIn
-    } catch is ExpiredTokenException {
+    } catch let error where isExpiredSession(error) {
         throw AwsealError.notLoggedIn
     }
+}
+
+// OIDC refresh failures that mean the session or client registration has
+// lapsed and only a new browser login can recover.
+func isExpiredSession(_ error: Error) -> Bool {
+    switch error {
+    case is ExpiredTokenException, is InvalidGrantException, is InvalidClientException, is UnauthorizedClientException:
+        return true
+    default:
+        return false
+    }
+}
+
+// Runs the device-authorization login, re-registering the OIDC client when its
+// registration has expired. Keeps the encryption key already proven by
+// decryption so renewal does not provision a new Secure Enclave key.
+func renewSession(
+    oidc: SSOOIDCClient, profile: String, creds: Creds, ssoStartUrl: String, requireBrowser: Bool
+) async throws -> Creds {
+    var creds = creds
+    do {
+        creds.ssoCreds = try await ssoLogin(oidc: oidc, profile: profile, ssoCreds: creds.ssoCreds,
+            ssoStartUrl: ssoStartUrl, requireBrowser: requireBrowser)
+    } catch is InvalidClientException, is UnauthorizedClientException {
+        let registration = try await registerClient(oidc: oidc, profile: profile)
+        creds.ssoCreds = try await ssoLogin(oidc: oidc, profile: profile, ssoCreds: registration,
+            ssoStartUrl: ssoStartUrl, requireBrowser: requireBrowser)
+    }
+    return creds
+}
+
+// Serializes credential use per profile so concurrent callers neither race
+// refresh-token rotation nor each open their own browser login.
+func withProfileLock<T>(profile: String, state: StateDirectory, _ body: () async throws -> T) async throws -> T {
+    try validateProfileName(profile)
+    let dir = state.url.appendingPathComponent("locks", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                            attributes: [.posixPermissions: 0o700])
+    let descriptor = open(dir.appendingPathComponent(profile).path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+    guard descriptor >= 0 else { throw AwsealError.generic("Unable to lock profile state.") }
+    defer { close(descriptor) }
+    // Poll without blocking so a waiter never pins a cooperative executor thread
+    // that the lock holder needs to make progress.
+    while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+        guard errno == EWOULDBLOCK || errno == EINTR else {
+            throw AwsealError.generic("Unable to lock profile state.")
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+    }
+    defer { flock(descriptor, LOCK_UN) }
+    return try await body()
 }
 
 func getRoleCreds(sso: SSOClient, accessToken: String, accountId: String, roleName: String) async throws -> RoleCreds {
@@ -409,36 +478,53 @@ func getRoleCreds(sso: SSOClient, accessToken: String, accountId: String, roleNa
 }
 
 func fetchRoleCreds(
-    profile: String, state: StateDirectory, oidc: SSOOIDCClient, sso: SSOClient, accountId: String, roleName: String
+    profile: String, state: StateDirectory, oidc: SSOOIDCClient, sso: SSOClient, accountId: String, roleName: String,
+    ssoStartUrl: String, autoLogin: Bool
 ) async throws -> RoleCreds {
+    try await withProfileLock(profile: profile, state: state) {
+        // Decryption requires Touch ID, so every path below, including a
+        // browser login, starts from an explicit biometric approval.
+        guard var creds = try loadCreds(profile: profile, state: state,
+            reason: authenticationReason(profile: profile, account: accountId, role: roleName)) else {
+            throw AwsealError.notLoggedIn
+        }
 
-    guard var creds = try loadCreds(profile: profile, state: state,
-        reason: authenticationReason(profile: profile, account: accountId, role: roleName)) else {
-        throw AwsealError.notLoggedIn
-    }
+        if let accessToken = creds.ssoCreds.accessToken {
+            do {
+                let roleCreds = try await getRoleCreds(
+                    sso: sso,
+                    accessToken: accessToken,
+                    accountId: accountId,
+                    roleName: roleName
+                )
+                try saveCreds(profile: profile, creds: creds, state: state)
+                return roleCreds
+            } catch is UnauthorizedException {}
 
-    guard let accessToken = creds.ssoCreds.accessToken else {
-        throw AwsealError.notLoggedIn
-    }
+            do {
+                let (accessToken, refreshToken) = try await refreshAccessToken(
+                    profile: profile,
+                    oidc: oidc,
+                    ssoCreds: creds.ssoCreds
+                )
+                creds.ssoCreds.accessToken = accessToken
+                creds.ssoCreds.refreshToken = refreshToken
+                // Preserve token rotation even if the subsequent role request fails.
+                try saveCreds(profile: profile, creds: creds, state: state)
+                return try await getRoleCreds(
+                    sso: sso,
+                    accessToken: accessToken,
+                    accountId: accountId,
+                    roleName: roleName
+                )
+            } catch AwsealError.notLoggedIn where autoLogin {}
+        }
 
-    var roleCreds: RoleCreds
-    do {
-        roleCreds = try await getRoleCreds(
-            sso: sso,
-            accessToken: accessToken,
-            accountId: accountId,
-            roleName: roleName
-        )
-    } catch is UnauthorizedException {
-        let (accessToken, refreshToken) = try await refreshAccessToken(
-            profile: profile,
-            oidc: oidc,
-            ssoCreds: creds.ssoCreds
-        )
-        creds.ssoCreds.accessToken = accessToken
-        creds.ssoCreds.refreshToken = refreshToken
-        // Preserve token rotation even if the subsequent role request fails.
+        guard autoLogin else { throw AwsealError.notLoggedIn }
+        creds = try await renewSession(oidc: oidc, profile: profile, creds: creds,
+            ssoStartUrl: ssoStartUrl, requireBrowser: true)
         try saveCreds(profile: profile, creds: creds, state: state)
+        guard let accessToken = creds.ssoCreds.accessToken else { throw AwsealError.notLoggedIn }
         return try await getRoleCreds(
             sso: sso,
             accessToken: accessToken,
@@ -446,8 +532,6 @@ func fetchRoleCreds(
             roleName: roleName
         )
     }
-    try saveCreds(profile: profile, creds: creds, state: state)
-    return roleCreds
 }
 
 func roleCredentialsJSON(creds: RoleCreds) throws -> Data {
@@ -485,7 +569,7 @@ func roleCredentialsJSON(creds: RoleCreds) throws -> Data {
 struct Awseal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "An AWS CLI credential_process using AWS SSO to mint credentials while storing secrets under a Secure Enclave key.",
-        version: "0.4.0-hardening.1",
+        version: "0.4.0-hardening.2",
         subcommands: [Login.self, FetchRoleCreds.self]
     )
 }
@@ -521,35 +605,20 @@ extension Awseal {
             _ = try KeyDB(state: state)
             let oidc = try await SSOOIDCClient(config: .init(
                 ignoreConfiguredEndpointURLs: true, region: profileConfig.ssoRegion, clientLogMode: .some(.none)))
-            var creds: Creds
-            if let existing = try loadCreds(profile: options.profile, state: state,
-                reason: authenticationReason(profile: options.profile, account: profileConfig.accountId, role: profileConfig.roleName)) {
-                creds = existing
-            } else {
-                let ssoCreds = try await registerClient(oidc: oidc, profile: options.profile)
-                creds = Creds(ssoCreds: ssoCreds)
-            }
+            try await withProfileLock(profile: options.profile, state: state) {
+                var creds: Creds
+                if let existing = try loadCreds(profile: options.profile, state: state,
+                    reason: authenticationReason(profile: options.profile, account: profileConfig.accountId, role: profileConfig.roleName)) {
+                    creds = existing
+                } else {
+                    let ssoCreds = try await registerClient(oidc: oidc, profile: options.profile)
+                    creds = Creds(ssoCreds: ssoCreds)
+                }
 
-            var ssoCreds: SsoCreds
-            do {
-                ssoCreds = try await ssoLogin(
-                    oidc: oidc,
-                    profile: options.profile,
-                    ssoCreds: creds.ssoCreds,
-                    ssoStartUrl: profileConfig.ssoStartUrl
-                )
-            } catch is InvalidClientException, is UnauthorizedException {
-                ssoCreds = try await registerClient(oidc: oidc, profile: options.profile)
-                creds = Creds(ssoCreds: ssoCreds)
-                ssoCreds = try await ssoLogin(
-                    oidc: oidc,
-                    profile: options.profile,
-                    ssoCreds: creds.ssoCreds,
-                    ssoStartUrl: profileConfig.ssoStartUrl
-                )
+                creds = try await renewSession(oidc: oidc, profile: options.profile, creds: creds,
+                    ssoStartUrl: profileConfig.ssoStartUrl, requireBrowser: false)
+                try saveCreds(profile: options.profile, creds: creds, state: state)
             }
-            creds.ssoCreds = ssoCreds
-            try saveCreds(profile: options.profile, creds: creds, state: state)
         }
     }
 
@@ -559,6 +628,9 @@ extension Awseal {
         )
 
         @OptionGroup var options: Options
+
+        @Flag(name: .long, help: "Fail instead of opening a browser login when the SSO session has expired.")
+        var noAutoLogin = false
 
         func run() async throws {
             do { try await execute() }
@@ -582,7 +654,9 @@ extension Awseal {
                 oidc: oidc,
                 sso: sso,
                 accountId: profileConfig.accountId,
-                roleName: profileConfig.roleName
+                roleName: profileConfig.roleName,
+                ssoStartUrl: profileConfig.ssoStartUrl,
+                autoLogin: !noAutoLogin
             )
             let output = try roleCredentialsJSON(creds: creds)
             FileHandle.standardOutput.write(output)
